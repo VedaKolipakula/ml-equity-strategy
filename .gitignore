@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+venv/
+
+# Secrets (Alpaca API keys will live here later) - NEVER commit
+.env
+
+# Data: large and fully re-creatable by running the pipeline
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Python / tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store

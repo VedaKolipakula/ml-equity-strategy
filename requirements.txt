@@ -1,0 +1,14 @@
+pandas
+numpy
+scikit-learn
+lightgbm
+matplotlib
+pyarrow
+yfinance
+alpaca-py
+pytest
+# Needed to scrape the Wikipedia table (pandas.read_html) and run the notebook
+lxml
+requests
+jupyter
+ipykernel
