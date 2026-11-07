@@ -284,3 +284,72 @@ def clean_prices(
                        len(report.big_jumps), max_abs_return * 100)
 
     return prices, volume, report
+
+
+# --------------------------------------------------------------------------
+# Step 4: wide tables + pipeline
+# --------------------------------------------------------------------------
+
+def build_wide_tables(long_df: pd.DataFrame, **clean_kwargs) -> tuple[pd.DataFrame, pd.DataFrame, CleaningReport]:
+    """Pivot raw long data into cleaned wide tables (dates x tickers).
+
+    Wide format is what cross-sectional work wants: `prices.pct_change(21)
+    .rank(axis=1)` ranks all stocks against each other on each date in one line.
+
+    We use 'Adj Close' (split- AND dividend-adjusted) so that percent changes
+    equal true total returns. Raw 'Close' would show fake -50% crashes on
+    2-for-1 split dates.
+
+    Returns (adj_close, volume, report).
+    """
+    long_df = long_df.reset_index()  # Date index -> column so we can pivot
+    adj_close = long_df.pivot(index="Date", columns="Ticker", values="Adj Close")
+    volume = long_df.pivot(index="Date", columns="Ticker", values="Volume")
+    return clean_prices(adj_close, volume, **clean_kwargs)
+
+
+def run_pipeline(start: str = START_DATE, end: str | None = None) -> dict[str, Path]:
+    """Run everything: tickers -> download -> raw parquet -> clean -> processed parquet.
+
+    Outputs:
+        data/raw/prices_raw.parquet            long-format OHLCV, untouched
+        data/processed/adj_close.parquet       wide, cleaned
+        data/processed/volume.parquet          wide, cleaned
+        data/processed/dropped_tickers.csv     ticker, reason (download + cleaning)
+        data/processed/flagged_jumps.csv       suspicious one-day moves (kept in data)
+    """
+    tickers = get_sp500_tickers()
+    long_df, failed = download_prices(tickers, start=start, end=end)
+    if long_df.empty:
+        raise RuntimeError("Download returned no data at all; check your network / yfinance.")
+    raw_path = save_raw(long_df)
+
+    adj_close, volume, report = build_wide_tables(long_df)
+
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "raw": raw_path,
+        "adj_close": PROCESSED_DIR / "adj_close.parquet",
+        "volume": PROCESSED_DIR / "volume.parquet",
+        "dropped": PROCESSED_DIR / "dropped_tickers.csv",
+        "jumps": PROCESSED_DIR / "flagged_jumps.csv",
+    }
+    adj_close.to_parquet(paths["adj_close"])
+    volume.to_parquet(paths["volume"])
+
+    dropped = {t: "download failed" for t in failed} | report.dropped
+    pd.Series(dropped, name="reason").rename_axis("ticker").to_csv(paths["dropped"])
+    report.big_jumps.to_csv(paths["jumps"], index=False)
+
+    logger.info("DONE: %d tickers x %d days kept | %d failed download | %d dropped in cleaning | "
+                "%d cells forward-filled | %d bad prices | %d flagged jumps",
+                adj_close.shape[1], adj_close.shape[0], len(failed), len(report.dropped),
+                report.cells_filled, report.non_positive_cells, len(report.big_jumps))
+    return paths
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Quiet yfinance's own per-ticker error spam; we log failures ourselves.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    run_pipeline()
