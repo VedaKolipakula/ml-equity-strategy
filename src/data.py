@@ -175,3 +175,112 @@ def save_raw(long_df: pd.DataFrame, path: Path | None = None) -> Path:
     long_df.to_parquet(path)
     logger.info("Saved raw data: %s (%d rows)", path, len(long_df))
     return path
+
+
+# --------------------------------------------------------------------------
+# Step 3: cleaning
+# --------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+# Thresholds (all overridable). Reasoning:
+MAX_MISSING_FRAC = 0.05   # >5% holes after a stock's first date => unreliable
+MIN_HISTORY_DAYS = 252    # ~1 trading year; needed for 12-month momentum features
+MAX_FILL_DAYS = 5         # ~1 trading week; longer gaps are real outages/halts
+MAX_ABS_DAILY_RETURN = 0.5  # |1-day move| > 50% is suspicious (flag only)
+
+
+@dataclass
+class CleaningReport:
+    """What the cleaner did -- so nothing is silently changed."""
+    dropped: dict[str, str] = field(default_factory=dict)  # ticker -> reason
+    non_positive_cells: int = 0     # price cells set to NaN because <= 0
+    cells_filled: int = 0           # price cells filled by short-gap ffill
+    big_jumps: pd.DataFrame = field(default_factory=pd.DataFrame)  # flagged, NOT removed
+
+
+def _fill_short_gaps(s: pd.Series, max_gap: int) -> pd.Series:
+    """Forward-fill NaN runs of length <= max_gap; leave longer runs entirely NaN.
+
+    Why not s.ffill(limit=max_gap)? Because that fills the FIRST max_gap days
+    of a long gap and leaves the rest NaN: a half-fabricated stretch of prices.
+    Here we measure each NaN run's full length and fill it only if short.
+    """
+    na = s.isna()
+    run_id = (na != na.shift()).cumsum()            # new id each time NaN-ness flips
+    run_len = na.groupby(run_id).transform("sum")   # for NaN runs: the run's length
+    fillable = na & (run_len <= max_gap)
+    return s.where(~fillable, s.ffill())
+
+
+def clean_prices(
+    prices: pd.DataFrame,
+    volume: pd.DataFrame,
+    *,
+    max_missing_frac: float = MAX_MISSING_FRAC,
+    min_history_days: int = MIN_HISTORY_DAYS,
+    max_fill_days: int = MAX_FILL_DAYS,
+    max_abs_return: float = MAX_ABS_DAILY_RETURN,
+) -> tuple[pd.DataFrame, pd.DataFrame, CleaningReport]:
+    """Clean wide (dates x tickers) adjusted-close and volume tables.
+
+    Order matters:
+      1. tidy index, 2. invalid values -> NaN, 3. drop bad tickers (judged on
+      the data BEFORE filling, so we measure real data quality, not our own
+      patches), 4. fill small gaps, 5. flag suspicious jumps.
+
+    Look-ahead note: forward-fill only uses PAST values (yesterday's price
+    stands in for today's), so it does not leak the future. Backward-fill
+    would, and we never use it.
+    """
+    report = CleaningReport()
+
+    # 1. Tidy: sorted unique dates, no all-empty rows (e.g. a bad calendar day).
+    prices = prices[~prices.index.duplicated(keep="last")].sort_index()
+    volume = volume[~volume.index.duplicated(keep="last")].sort_index()
+    prices = prices.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+    volume = volume.reindex(index=prices.index, columns=prices.columns)
+
+    # 2. Impossible values -> NaN. A price <= 0 is always a data error.
+    bad = prices <= 0
+    report.non_positive_cells = int(bad.sum().sum())
+    prices = prices.mask(bad)
+    volume = volume.mask(volume < 0)
+
+    # 3. Drop tickers with too little / too patchy data.
+    for ticker in prices.columns:
+        col = prices[ticker]
+        first = col.first_valid_index()
+        if first is None:
+            report.dropped[ticker] = "no valid prices"
+            continue
+        window = col.loc[first:]  # from first trade to END of calendar (stale tails count)
+        if col.notna().sum() < min_history_days:
+            report.dropped[ticker] = f"short history ({int(col.notna().sum())} days)"
+        elif window.isna().mean() > max_missing_frac:
+            report.dropped[ticker] = f"{window.isna().mean():.1%} missing since first date"
+    keep = [t for t in prices.columns if t not in report.dropped]
+    prices, volume = prices[keep], volume[keep]
+    for t, why in report.dropped.items():
+        logger.warning("Dropped %s: %s", t, why)
+
+    # 4. Fill short gaps in PRICES only. Volume is never filled: yesterday's
+    #    volume is not today's, so filling would invent trading activity.
+    before = prices.isna().sum().sum()
+    prices = prices.apply(_fill_short_gaps, max_gap=max_fill_days)
+    report.cells_filled = int(before - prices.isna().sum().sum())
+
+    # 5. Flag (don't delete) huge one-day moves. Real ones exist (earnings
+    #    shocks), but so do un-adjusted splits and bad ticks; a human should look.
+    ret = prices.pct_change(fill_method=None)
+    jumps = ret.stack()
+    jumps = jumps[jumps.abs() > max_abs_return]
+    report.big_jumps = jumps.rename("return").reset_index().rename(
+        columns={"level_0": "date", "level_1": "ticker", "Date": "date", "Ticker": "ticker"})
+    if len(report.big_jumps):
+        logger.warning("%d one-day moves exceed %.0f%% (flagged, kept)",
+                       len(report.big_jumps), max_abs_return * 100)
+
+    return prices, volume, report
